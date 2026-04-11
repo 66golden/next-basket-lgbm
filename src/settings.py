@@ -1,11 +1,11 @@
 import os
 
-from pathlib import Path
+import path
 
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = SRC_DIR.parent
-DATA_DIR = PROJECT_DIR / "data"
-RESULTS_DIR = PROJECT_DIR / "results"
+SRC_DIR = path.Path(os.path.abspath(os.path.dirname(__file__))).abspath()
+DATA_DIR = path.Path(os.path.dirname(__file__)).joinpath("../data").abspath()
+RESULTS_DIR = path.Path(os.path.dirname(__file__)).joinpath("../results").abspath()
+REPORTS_DIR = RESULTS_DIR.joinpath("./reports").abspath()
 
 SEED = 42
 

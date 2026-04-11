@@ -152,16 +152,19 @@ class NBRDatasetBase(ABC):
             train_path,
             converters={"basket": literal_eval},
             parse_dates=["timestamp"],
+            infer_datetime_format=True,
         )
         self.val_df = pd.read_csv(
             val_path,
             converters={"basket": literal_eval},
             parse_dates=["timestamp"],
+            infer_datetime_format=True,
         )
         self.test_df = pd.read_csv(
             test_path,
             converters={"basket": literal_eval},
             parse_dates=["timestamp"],
+            infer_datetime_format=True,
         )
 
         self._print("Interactions loaded")
