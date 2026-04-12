@@ -13,8 +13,6 @@ from src.models.core import IRecommenderNextTs
 
 
 FEATURE_COLUMNS = [
-    "candidate_from_history",
-    "candidate_from_global_top",
     "user_baskets_count",
     "user_avg_basket_size",
     "user_days_since_last_basket",
@@ -28,6 +26,14 @@ FEATURE_COLUMNS = [
     "ui_days_since_last_purchase",
     "ui_mean_gap_days",
     "ui_recency_over_gap",
+    "ui_gap_std_days",
+    "ui_last_gap_days",
+    "ui_days_since_last_purchase_minus_mean_gap",
+    "ui_abs_recency_minus_mean_gap",
+    "ui_count_last_30d",
+    "ui_count_last_60d",
+    "ui_cooc_last_basket_sum",
+    "ui_cooc_last_basket_max",
 ]
 
 
@@ -42,6 +48,12 @@ def _safe_mean(values: list[float]) -> float:
     if len(values) == 0:
         return 0.0
     return float(np.mean(values))
+
+
+def _safe_std(values: list[float]) -> float:
+    if len(values) == 0:
+        return 0.0
+    return float(np.std(values))
 
 
 class LGBMRankerRecommender(IRecommenderNextTs):
@@ -266,21 +278,22 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         }
 
     def _build_query_rows(
-            self,
-            user_id: int,
-            history_df: pd.DataFrame,
-            target_ts: pd.Timestamp,
-            target_items: list[int] | None,
-            require_positive: bool,
-            global_top_items: list[int],
-            global_item_count: dict[int, int],
-            global_item_rank_pct: dict[int, float],
+        self,
+        user_id: int,
+        history_df: pd.DataFrame,
+        target_ts: pd.Timestamp,
+        target_items: list[int] | None,
+        require_positive: bool,
+        global_top_items: list[int],
+        global_item_count: dict[int, int],
+        global_item_rank_pct: dict[int, float],
     ):
         history_items = set()
         item_count = defaultdict(int)
         item_ts = defaultdict(list)
         item_count_last_3 = defaultdict(int)
         item_count_last_5 = defaultdict(int)
+        pair_cooc_count = defaultdict(int)
 
         user_baskets = history_df["basket"].tolist()
         history_timestamps = pd.to_datetime(history_df["timestamp"]).tolist()
@@ -288,10 +301,16 @@ class LGBMRankerRecommender(IRecommenderNextTs):
 
         last_3_start = max(0, num_history_baskets - 3)
         last_5_start = max(0, num_history_baskets - 5)
+        last_30d_boundary = target_ts - pd.Timedelta(days=30)
+        last_60d_boundary = target_ts - pd.Timedelta(days=60)
+
+        basket_sets = []
 
         for basket_idx, (basket, basket_ts) in enumerate(zip(user_baskets, history_timestamps)):
             basket_unique = set(map(int, basket))
+            basket_sets.append(basket_unique)
             history_items.update(basket_unique)
+
             for item_id in basket_unique:
                 item_count[item_id] += 1
                 item_ts[item_id].append(pd.Timestamp(basket_ts))
@@ -299,6 +318,11 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     item_count_last_3[item_id] += 1
                 if basket_idx >= last_5_start:
                     item_count_last_5[item_id] += 1
+
+            basket_sorted = sorted(basket_unique)
+            for i in range(len(basket_sorted)):
+                for j in range(i + 1, len(basket_sorted)):
+                    pair_cooc_count[(basket_sorted[i], basket_sorted[j])] += 1
 
         candidates = list(sorted(history_items))
         history_candidate_set = set(candidates)
@@ -317,8 +341,10 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         user_avg_basket_size = _safe_mean([len(basket) for basket in user_baskets])
         if user_baskets_count > 0:
             user_days_since_last_basket = _days_between(target_ts, pd.Timestamp(history_timestamps[-1]))
+            last_basket_items = basket_sets[-1]
         else:
             user_days_since_last_basket = -1.0
+            last_basket_items = set()
 
         rows = []
         for item_id in candidates:
@@ -327,13 +353,17 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             ui_count_last_3 = int(item_count_last_3.get(item_id, 0))
             ui_count_last_5 = int(item_count_last_5.get(item_id, 0))
             ui_in_last_basket = int(
-                user_baskets_count > 0 and item_id in set(map(int, user_baskets[-1]))
+                user_baskets_count > 0 and item_id in last_basket_items
             )
 
             if len(purchase_ts) > 0:
                 ui_days_since_last_purchase = _days_between(target_ts, purchase_ts[-1])
+                ui_count_last_30d = int(sum(ts >= last_30d_boundary for ts in purchase_ts))
+                ui_count_last_60d = int(sum(ts >= last_60d_boundary for ts in purchase_ts))
             else:
                 ui_days_since_last_purchase = -1.0
+                ui_count_last_30d = 0
+                ui_count_last_60d = 0
 
             if len(purchase_ts) >= 2:
                 gaps = [
@@ -341,21 +371,45 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     for i in range(1, len(purchase_ts))
                 ]
                 ui_mean_gap_days = _safe_mean(gaps)
+                ui_gap_std_days = _safe_std(gaps)
+                ui_last_gap_days = float(gaps[-1])
             else:
                 ui_mean_gap_days = 0.0
+                ui_gap_std_days = 0.0
+                ui_last_gap_days = 0.0
 
             if ui_days_since_last_purchase >= 0 and ui_mean_gap_days > 0:
                 ui_recency_over_gap = ui_days_since_last_purchase / ui_mean_gap_days
+                ui_days_since_last_purchase_minus_mean_gap = (
+                    ui_days_since_last_purchase - ui_mean_gap_days
+                )
+                ui_abs_recency_minus_mean_gap = abs(
+                    ui_days_since_last_purchase_minus_mean_gap
+                )
             else:
                 ui_recency_over_gap = 0.0
+                ui_days_since_last_purchase_minus_mean_gap = 0.0
+                ui_abs_recency_minus_mean_gap = 0.0
+
+            cooc_values = []
+            for ctx_item in last_basket_items:
+                if ctx_item == item_id:
+                    continue
+                a, b = sorted((int(item_id), int(ctx_item)))
+                cooc_values.append(float(pair_cooc_count.get((a, b), 0)))
+
+            if len(cooc_values) > 0:
+                ui_cooc_last_basket_sum = float(sum(cooc_values))
+                ui_cooc_last_basket_max = float(max(cooc_values))
+            else:
+                ui_cooc_last_basket_sum = 0.0
+                ui_cooc_last_basket_max = 0.0
 
             rows.append(
                 {
                     "user_id": int(user_id),
                     "item_id": int(item_id),
                     "label": int(item_id in target_set),
-                    "candidate_from_history": int(item_id in history_candidate_set),
-                    "candidate_from_global_top": int(item_id in global_top_items),
                     "user_baskets_count": user_baskets_count,
                     "user_avg_basket_size": float(user_avg_basket_size),
                     "user_days_since_last_basket": float(user_days_since_last_basket),
@@ -369,6 +423,18 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     "ui_days_since_last_purchase": float(ui_days_since_last_purchase),
                     "ui_mean_gap_days": float(ui_mean_gap_days),
                     "ui_recency_over_gap": float(ui_recency_over_gap),
+                    "ui_gap_std_days": float(ui_gap_std_days),
+                    "ui_last_gap_days": float(ui_last_gap_days),
+                    "ui_days_since_last_purchase_minus_mean_gap": float(
+                        ui_days_since_last_purchase_minus_mean_gap
+                    ),
+                    "ui_abs_recency_minus_mean_gap": float(
+                        ui_abs_recency_minus_mean_gap
+                    ),
+                    "ui_count_last_30d": ui_count_last_30d,
+                    "ui_count_last_60d": ui_count_last_60d,
+                    "ui_cooc_last_basket_sum": float(ui_cooc_last_basket_sum),
+                    "ui_cooc_last_basket_max": float(ui_cooc_last_basket_max),
                 }
             )
 
