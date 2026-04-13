@@ -34,6 +34,11 @@ FEATURE_COLUMNS = [
     "ui_count_last_60d",
     "ui_cooc_last_basket_sum",
     "ui_cooc_last_basket_max",
+    "ui_gap_cv_days",
+    "ui_days_since_last_purchase_over_last_gap",
+    "ui_is_overdue_last_gap",
+    "ui_count_share_last_60d",
+    "ui_cooc_last_basket_mean",
 ]
 
 
@@ -54,6 +59,12 @@ def _safe_std(values: list[float]) -> float:
     if len(values) == 0:
         return 0.0
     return float(np.std(values))
+
+
+def _safe_div(a: float, b: float) -> float:
+    if b <= 0:
+        return 0.0
+    return float(a / b)
 
 
 class LGBMRankerRecommender(IRecommenderNextTs):
@@ -352,9 +363,7 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             ui_count_total = int(item_count.get(item_id, 0))
             ui_count_last_3 = int(item_count_last_3.get(item_id, 0))
             ui_count_last_5 = int(item_count_last_5.get(item_id, 0))
-            ui_in_last_basket = int(
-                user_baskets_count > 0 and item_id in last_basket_items
-            )
+            ui_in_last_basket = int(user_baskets_count > 0 and item_id in last_basket_items)
 
             if len(purchase_ts) > 0:
                 ui_days_since_last_purchase = _days_between(target_ts, purchase_ts[-1])
@@ -401,9 +410,24 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             if len(cooc_values) > 0:
                 ui_cooc_last_basket_sum = float(sum(cooc_values))
                 ui_cooc_last_basket_max = float(max(cooc_values))
+                ui_cooc_last_basket_mean = float(np.mean(cooc_values))
             else:
                 ui_cooc_last_basket_sum = 0.0
                 ui_cooc_last_basket_max = 0.0
+                ui_cooc_last_basket_mean = 0.0
+
+            ui_gap_cv_days = _safe_div(ui_gap_std_days, ui_mean_gap_days)
+            ui_days_since_last_purchase_over_last_gap = (
+                _safe_div(ui_days_since_last_purchase, ui_last_gap_days)
+                if ui_days_since_last_purchase >= 0
+                else 0.0
+            )
+            ui_is_overdue_last_gap = int(
+                ui_days_since_last_purchase >= 0
+                and ui_last_gap_days > 0
+                and ui_days_since_last_purchase > ui_last_gap_days
+            )
+            ui_count_share_last_60d = _safe_div(ui_count_last_60d, ui_count_total)
 
             rows.append(
                 {
@@ -435,6 +459,13 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     "ui_count_last_60d": ui_count_last_60d,
                     "ui_cooc_last_basket_sum": float(ui_cooc_last_basket_sum),
                     "ui_cooc_last_basket_max": float(ui_cooc_last_basket_max),
+                    "ui_gap_cv_days": float(ui_gap_cv_days),
+                    "ui_days_since_last_purchase_over_last_gap": float(
+                        ui_days_since_last_purchase_over_last_gap
+                    ),
+                    "ui_is_overdue_last_gap": ui_is_overdue_last_gap,
+                    "ui_count_share_last_60d": float(ui_count_share_last_60d),
+                    "ui_cooc_last_basket_mean": float(ui_cooc_last_basket_mean),
                 }
             )
 
