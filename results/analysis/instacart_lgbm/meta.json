@@ -1,0 +1,9 @@
+{
+  "dataset": "instacart",
+  "explain_split": "validate",
+  "num_train_rows": 3497812,
+  "num_explained_rows": 20000,
+  "positive_rows_explained": 10000,
+  "negative_rows_explained": 10000,
+  "num_features": 26
+}
