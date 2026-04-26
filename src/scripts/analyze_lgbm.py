@@ -87,6 +87,8 @@ def build_rows_for_split(
             global_top_items=model._global_top_items,
             global_item_count=model._global_item_count,
             global_item_rank_pct=model._global_item_rank_pct,
+            global_item_ts=model._global_item_ts,
+            global_item_gap_cumsum=model._global_item_gap_cumsum,
         )
 
         if len(query_rows) == 0:

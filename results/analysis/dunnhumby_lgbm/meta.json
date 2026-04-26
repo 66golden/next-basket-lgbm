@@ -1,9 +1,9 @@
 {
   "dataset": "dunnhumby",
   "explain_split": "validate",
-  "num_train_rows": 993195,
+  "num_train_rows": 1181043,
   "num_explained_rows": 20000,
-  "positive_rows_explained": 6324,
-  "negative_rows_explained": 13676,
-  "num_features": 26
+  "positive_rows_explained": 6596,
+  "negative_rows_explained": 13404,
+  "num_features": 28
 }

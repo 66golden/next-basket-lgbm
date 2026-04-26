@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 
 import lightgbm as lgb
@@ -18,6 +19,15 @@ FEATURE_COLUMNS = [
     "user_days_since_last_basket",
     "item_global_count",
     "item_global_rank_pct",
+
+    "item_global_count_before_target",
+    "item_global_days_since_last_purchase",
+    "item_global_count_last_30d",
+    "item_global_count_last_90d",
+    "item_global_recent_share_90d",
+    "item_global_recency_over_mean_gap",
+    "item_global_is_stale_90d",
+
     "ui_count_total",
     "ui_repeat_rate",
     "ui_in_last_basket",
@@ -34,11 +44,6 @@ FEATURE_COLUMNS = [
     "ui_count_last_60d",
     "ui_cooc_last_basket_sum",
     "ui_cooc_last_basket_max",
-    "ui_gap_cv_days",
-    "ui_days_since_last_purchase_over_last_gap",
-    "ui_is_overdue_last_gap",
-    "ui_count_share_last_60d",
-    "ui_cooc_last_basket_mean",
 ]
 
 
@@ -103,6 +108,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         self._global_top_items = None
         self._global_item_count = None
         self._global_item_rank_pct = None
+        self._global_item_ts = None
+        self._global_item_gap_cumsum = None
 
     def fit(self, dataset: NBRDatasetBase):
         cache_key = self._make_cache_key(dataset)
@@ -117,6 +124,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         self._global_top_items = cached["global_top_items"]
         self._global_item_count = cached["global_item_count"]
         self._global_item_rank_pct = cached["global_item_rank_pct"]
+        self._global_item_ts = cached["global_item_ts"]
+        self._global_item_gap_cumsum = cached["global_item_gap_cumsum"]
 
         self._model = lgb.LGBMRanker(
             objective="lambdarank",
@@ -174,6 +183,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                 global_top_items=self._global_top_items,
                 global_item_count=self._global_item_count,
                 global_item_rank_pct=self._global_item_rank_pct,
+                global_item_ts=self._global_item_ts,
+                global_item_gap_cumsum=self._global_item_gap_cumsum,
             )
             if len(query_rows) == 0:
                 continue
@@ -223,6 +234,103 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             int(self.global_top_k),
         )
 
+    def _build_global_item_time_index(self, train_df: pd.DataFrame):
+        exploded = train_df.loc[:, ["timestamp", "basket"]].explode(
+            "basket", ignore_index=True
+        )
+        exploded = exploded.rename(columns={"basket": "item_id"})
+        exploded["item_id"] = exploded["item_id"].astype(int)
+        exploded["timestamp"] = pd.to_datetime(exploded["timestamp"])
+        exploded = exploded.sort_values(["item_id", "timestamp"]).reset_index(drop=True)
+
+        global_item_ts = {}
+        global_item_gap_cumsum = {}
+
+        for item_id, item_df in exploded.groupby("item_id", sort=False):
+            ts_list = list(item_df["timestamp"])
+            global_item_ts[int(item_id)] = ts_list
+
+            if len(ts_list) >= 2:
+                gaps = np.array(
+                    [
+                        _days_between(ts_list[i], ts_list[i - 1])
+                        for i in range(1, len(ts_list))
+                    ],
+                    dtype=np.float32,
+                )
+                global_item_gap_cumsum[int(item_id)] = np.cumsum(gaps)
+            else:
+                global_item_gap_cumsum[int(item_id)] = np.array([], dtype=np.float32)
+
+        return global_item_ts, global_item_gap_cumsum
+
+    def _get_global_item_time_features(
+        self,
+        item_id: int,
+        target_ts: pd.Timestamp,
+        global_item_ts: dict[int, list[pd.Timestamp]],
+        global_item_gap_cumsum: dict[int, np.ndarray],
+    ):
+        ts_list = global_item_ts.get(int(item_id), [])
+
+        if len(ts_list) == 0:
+            return {
+                "item_global_count_before_target": 0,
+                "item_global_days_since_last_purchase": -1.0,
+                "item_global_count_last_30d": 0,
+                "item_global_count_last_90d": 0,
+                "item_global_recent_share_90d": 0.0,
+                "item_global_recency_over_mean_gap": 0.0,
+                "item_global_is_stale_90d": 1,
+            }
+
+        prefix_count = bisect_left(ts_list, target_ts)
+
+        if prefix_count == 0:
+            return {
+                "item_global_count_before_target": 0,
+                "item_global_days_since_last_purchase": -1.0,
+                "item_global_count_last_30d": 0,
+                "item_global_count_last_90d": 0,
+                "item_global_recent_share_90d": 0.0,
+                "item_global_recency_over_mean_gap": 0.0,
+                "item_global_is_stale_90d": 1,
+            }
+
+        last_ts = ts_list[prefix_count - 1]
+        days_since_last = _days_between(target_ts, last_ts)
+
+        boundary_30d = target_ts - pd.Timedelta(days=30)
+        boundary_90d = target_ts - pd.Timedelta(days=90)
+
+        left_30 = bisect_left(ts_list, boundary_30d, 0, prefix_count)
+        left_90 = bisect_left(ts_list, boundary_90d, 0, prefix_count)
+
+        count_last_30d = int(prefix_count - left_30)
+        count_last_90d = int(prefix_count - left_90)
+        recent_share_90d = _safe_div(count_last_90d, prefix_count)
+
+        if prefix_count >= 2:
+            gap_cumsum = global_item_gap_cumsum.get(
+                int(item_id), np.array([], dtype=np.float32)
+            )
+            mean_gap = float(gap_cumsum[prefix_count - 2] / (prefix_count - 1))
+            recency_over_mean_gap = _safe_div(days_since_last, mean_gap)
+        else:
+            recency_over_mean_gap = 0.0
+
+        is_stale_90d = int(count_last_90d == 0)
+
+        return {
+            "item_global_count_before_target": int(prefix_count),
+            "item_global_days_since_last_purchase": float(days_since_last),
+            "item_global_count_last_30d": count_last_30d,
+            "item_global_count_last_90d": count_last_90d,
+            "item_global_recent_share_90d": float(recent_share_90d),
+            "item_global_recency_over_mean_gap": float(recency_over_mean_gap),
+            "item_global_is_stale_90d": is_stale_90d,
+        }
+
     def _build_training_cache(self, dataset: NBRDatasetBase):
         train_df = dataset.train_df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
         user_histories = {
@@ -246,6 +354,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         for rank, (item_id, _) in enumerate(global_item_count_sorted, start=1):
             global_item_rank_pct[int(item_id)] = 1.0 - ((rank - 1) / max(num_ranked_items - 1, 1))
 
+        global_item_ts, global_item_gap_cumsum = self._build_global_item_time_index(train_df)
+
         rows = []
         group_train = []
         for user_id, user_df in user_histories.items():
@@ -266,6 +376,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                 global_top_items=global_top_items,
                 global_item_count=global_item_count,
                 global_item_rank_pct=global_item_rank_pct,
+                global_item_ts=global_item_ts,
+                global_item_gap_cumsum=global_item_gap_cumsum,
             )
             if len(query_rows) == 0:
                 continue
@@ -274,6 +386,12 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             group_train.append(len(query_rows))
 
         train_rows = pd.DataFrame(rows)
+        if len(train_rows) == 0:
+            raise RuntimeError(
+                "No train rows were built for LGBMRankerRecommender. "
+                "Check candidate generation and split files."
+            )
+
         x_train = train_rows.loc[:, FEATURE_COLUMNS].astype(np.float32)
         y_train = train_rows["label"].astype(np.int32).to_numpy()
 
@@ -283,6 +401,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             "global_top_items": global_top_items,
             "global_item_count": global_item_count,
             "global_item_rank_pct": global_item_rank_pct,
+            "global_item_ts": global_item_ts,
+            "global_item_gap_cumsum": global_item_gap_cumsum,
             "x_train": x_train,
             "y_train": y_train,
             "group_train": group_train,
@@ -298,6 +418,8 @@ class LGBMRankerRecommender(IRecommenderNextTs):
         global_top_items: list[int],
         global_item_count: dict[int, int],
         global_item_rank_pct: dict[int, float],
+        global_item_ts: dict[int, list[pd.Timestamp]],
+        global_item_gap_cumsum: dict[int, np.ndarray],
     ):
         history_items = set()
         item_count = defaultdict(int)
@@ -365,6 +487,13 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             ui_count_last_5 = int(item_count_last_5.get(item_id, 0))
             ui_in_last_basket = int(user_baskets_count > 0 and item_id in last_basket_items)
 
+            global_item_time_features = self._get_global_item_time_features(
+                item_id=int(item_id),
+                target_ts=target_ts,
+                global_item_ts=global_item_ts,
+                global_item_gap_cumsum=global_item_gap_cumsum,
+            )
+
             if len(purchase_ts) > 0:
                 ui_days_since_last_purchase = _days_between(target_ts, purchase_ts[-1])
                 ui_count_last_30d = int(sum(ts >= last_30d_boundary for ts in purchase_ts))
@@ -410,24 +539,9 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             if len(cooc_values) > 0:
                 ui_cooc_last_basket_sum = float(sum(cooc_values))
                 ui_cooc_last_basket_max = float(max(cooc_values))
-                ui_cooc_last_basket_mean = float(np.mean(cooc_values))
             else:
                 ui_cooc_last_basket_sum = 0.0
                 ui_cooc_last_basket_max = 0.0
-                ui_cooc_last_basket_mean = 0.0
-
-            ui_gap_cv_days = _safe_div(ui_gap_std_days, ui_mean_gap_days)
-            ui_days_since_last_purchase_over_last_gap = (
-                _safe_div(ui_days_since_last_purchase, ui_last_gap_days)
-                if ui_days_since_last_purchase >= 0
-                else 0.0
-            )
-            ui_is_overdue_last_gap = int(
-                ui_days_since_last_purchase >= 0
-                and ui_last_gap_days > 0
-                and ui_days_since_last_purchase > ui_last_gap_days
-            )
-            ui_count_share_last_60d = _safe_div(ui_count_last_60d, ui_count_total)
 
             rows.append(
                 {
@@ -439,6 +553,29 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     "user_days_since_last_basket": float(user_days_since_last_basket),
                     "item_global_count": int(global_item_count.get(int(item_id), 0)),
                     "item_global_rank_pct": float(global_item_rank_pct.get(int(item_id), 0.0)),
+
+                    "item_global_count_before_target": global_item_time_features[
+                        "item_global_count_before_target"
+                    ],
+                    "item_global_days_since_last_purchase": global_item_time_features[
+                        "item_global_days_since_last_purchase"
+                    ],
+                    "item_global_count_last_30d": global_item_time_features[
+                        "item_global_count_last_30d"
+                    ],
+                    "item_global_count_last_90d": global_item_time_features[
+                        "item_global_count_last_90d"
+                    ],
+                    "item_global_recent_share_90d": global_item_time_features[
+                        "item_global_recent_share_90d"
+                    ],
+                    "item_global_recency_over_mean_gap": global_item_time_features[
+                        "item_global_recency_over_mean_gap"
+                    ],
+                    "item_global_is_stale_90d": global_item_time_features[
+                        "item_global_is_stale_90d"
+                    ],
+
                     "ui_count_total": ui_count_total,
                     "ui_repeat_rate": float(ui_count_total / max(user_baskets_count, 1)),
                     "ui_in_last_basket": ui_in_last_basket,
@@ -459,13 +596,6 @@ class LGBMRankerRecommender(IRecommenderNextTs):
                     "ui_count_last_60d": ui_count_last_60d,
                     "ui_cooc_last_basket_sum": float(ui_cooc_last_basket_sum),
                     "ui_cooc_last_basket_max": float(ui_cooc_last_basket_max),
-                    "ui_gap_cv_days": float(ui_gap_cv_days),
-                    "ui_days_since_last_purchase_over_last_gap": float(
-                        ui_days_since_last_purchase_over_last_gap
-                    ),
-                    "ui_is_overdue_last_gap": ui_is_overdue_last_gap,
-                    "ui_count_share_last_60d": float(ui_count_share_last_60d),
-                    "ui_cooc_last_basket_mean": float(ui_cooc_last_basket_mean),
                 }
             )
 
@@ -484,14 +614,14 @@ class LGBMRankerRecommender(IRecommenderNextTs):
     @classmethod
     def sample_params(cls, trial: optuna.Trial) -> dict:
         return {
-            "global_top_k": 100,
-            "num_leaves": trial.suggest_categorical("num_leaves", [31, 63, 127]),
-            "learning_rate": trial.suggest_categorical("learning_rate", [0.01, 0.03, 0.05, 0.1]),
-            "n_estimators": trial.suggest_categorical("n_estimators", [100, 200, 400]),
+            "global_top_k": trial.suggest_categorical("num_leaves", [100, 200]),
+            "num_leaves": trial.suggest_categorical("num_leaves", [10, 63, 127]),
+            "learning_rate": trial.suggest_categorical("learning_rate", [0.01, 0.05, 0.07]),
+            "n_estimators": trial.suggest_categorical("n_estimators", [100, 120, 150]),
             "min_child_samples": trial.suggest_categorical("min_child_samples", [10, 20, 50]),
-            "subsample": trial.suggest_categorical("subsample", [0.7, 0.85, 1.0]),
-            "colsample_bytree": trial.suggest_categorical("colsample_bytree", [0.7, 0.85, 1.0]),
-            "reg_alpha": trial.suggest_categorical("reg_alpha", [0.0, 1e-3, 1e-1]),
+            "subsample": trial.suggest_categorical("subsample", [0.7, 0.85]),
+            "colsample_bytree": trial.suggest_categorical("colsample_bytree", [0.7, 0.85]),
+            "reg_alpha": trial.suggest_categorical("reg_alpha", [0.0, 1e-3]),
             "reg_lambda": trial.suggest_categorical("reg_lambda", [0.0, 1e-3, 1e-1]),
             "random_state": 42,
             "n_jobs": -1,
