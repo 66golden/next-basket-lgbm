@@ -6,6 +6,7 @@ from .tifuknn import (
     TIFUKNNTimeDaysNextTsRecommender,
 )
 from .lgbm_ranker import LGBMRankerRecommender
+from .dcn_v2_ranker import DCNV2RankerRecommender
 from .core import IRecommender, IRecommenderNextTs
 
 
@@ -17,4 +18,5 @@ MODELS = {
     "tifuknn_time_days": TIFUKNNTimeDaysRecommender,
     "tifuknn_time_days_next_ts": TIFUKNNTimeDaysNextTsRecommender,
     "lgbm_ranker": LGBMRankerRecommender,
+    "dcn_v2_ranker": DCNV2RankerRecommender,
 }

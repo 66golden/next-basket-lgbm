@@ -14,36 +14,37 @@ from src.models.core import IRecommenderNextTs
 
 
 FEATURE_COLUMNS = [
-    "user_baskets_count",
-    "user_avg_basket_size",
-    "user_days_since_last_basket",
-    "item_global_count",
-    "item_global_rank_pct",
+    "user_baskets_count",  # сколько корзин есть в истории пользователя
+    "user_avg_basket_size",  # средний размер корзины пользователя в истории
+    "user_days_since_last_basket",  # сколько дней прошло после последней корзины пользователя
 
-    "item_global_count_before_target",
-    "item_global_days_since_last_purchase",
-    "item_global_count_last_30d",
-    "item_global_count_last_90d",
-    "item_global_recent_share_90d",
-    "item_global_recency_over_mean_gap",
-    "item_global_is_stale_90d",
+    "item_global_count",  # сколько раз товар встречался во всей train-выборке
+    "item_global_rank_pct",  # глобальный ранг популярности товара: чем ближе к 1, тем популярнее товар
 
-    "ui_count_total",
-    "ui_repeat_rate",
-    "ui_in_last_basket",
-    "ui_count_last_3",
-    "ui_count_last_5",
-    "ui_days_since_last_purchase",
-    "ui_mean_gap_days",
-    "ui_recency_over_gap",
-    "ui_gap_std_days",
-    "ui_last_gap_days",
-    "ui_days_since_last_purchase_minus_mean_gap",
-    "ui_abs_recency_minus_mean_gap",
-    "ui_count_last_30d",
-    "ui_count_last_60d",
-    "ui_cooc_last_basket_sum",
-    "ui_cooc_last_basket_max",
+    "item_global_count_before_target",  # сколько раз товар встречался в train
+    "item_global_days_since_last_purchase",  # сколько дней прошло с последней глобальной покупки товара
+    "item_global_count_last_30d",  # сколько раз товар покупали все пользователи за последние 30 дней
+    "item_global_count_last_90d",  # сколько раз товар покупали все пользователи за последние 90 дней
+    "item_global_recent_share_90d",  # доля глобальных покупок товара за последние 90 дней
+    "item_global_recency_over_mean_gap",  # = global_days_since_last_purchase / global_mean_gap_days
+    "item_global_is_stale_90d",  # флаг: item_global_count_last_90d == 0
+
+    "ui_count_total",  # сколько раз конкретный пользователь покупал данный товар
+    "ui_repeat_rate",  # доля корзин пользователя, в которых встречался этот товар
+    "ui_in_last_basket",  # был ли товар в последней корзине пользователя
+    "ui_count_last_3",  # сколько раз товар встречался в последних 3 корзинах пользователя
+    "ui_count_last_5",  # сколько раз товар встречался в последних 5 корзинах пользователя
+    "ui_days_since_last_purchase",  # сколько дней прошло с последней покупки этого товара пользователем
+    "ui_mean_gap_days",  # средний промежуток в днях между покупками этого товара пользователем
+    "ui_recency_over_gap",  # = days_since_last_purchase / mean_gap_days
+    "ui_gap_std_days",  # стандартное отклонение промежутков между покупками товара
+    "ui_last_gap_days",  # промежуток между двумя последними покупками товара
+    "ui_days_since_last_purchase_minus_mean_gap",  # = days_since_last_purchase - mean_gap_days
+    "ui_abs_recency_minus_mean_gap",  # = abs(days_since_last_purchase - mean_gap_days)
+    "ui_count_last_30d",  # сколько раз пользователь покупал товар за последние 30 дней до прогноза
+    "ui_count_last_60d",  # сколько раз пользователь покупал товар за последние 60 дней до прогноза
+    "ui_cooc_last_basket_sum",  # насколько этот товар исторически часто покупался вместе с товарами из последней корзины
+    "ui_cooc_last_basket_max",  # максимальная совместная связь кандидата с одним из товаров последней корзины
 ]
 
 
@@ -614,7 +615,7 @@ class LGBMRankerRecommender(IRecommenderNextTs):
     @classmethod
     def sample_params(cls, trial: optuna.Trial) -> dict:
         return {
-            "global_top_k": trial.suggest_categorical("num_leaves", [100, 200]),
+            "global_top_k": trial.suggest_categorical("global_top_k", [100, 200]),
             "num_leaves": trial.suggest_categorical("num_leaves", [10, 63, 127]),
             "learning_rate": trial.suggest_categorical("learning_rate", [0.01, 0.05, 0.07]),
             "n_estimators": trial.suggest_categorical("n_estimators", [100, 120, 150]),
@@ -622,7 +623,7 @@ class LGBMRankerRecommender(IRecommenderNextTs):
             "subsample": trial.suggest_categorical("subsample", [0.7, 0.85]),
             "colsample_bytree": trial.suggest_categorical("colsample_bytree", [0.7, 0.85]),
             "reg_alpha": trial.suggest_categorical("reg_alpha", [0.0, 1e-3]),
-            "reg_lambda": trial.suggest_categorical("reg_lambda", [0.0, 1e-3, 1e-1]),
+            "reg_lambda": trial.suggest_categorical("reg_lambda", [0.0, 1e-1, 1e-3]),
             "random_state": 42,
             "n_jobs": -1,
         }
